@@ -500,10 +500,25 @@ impl ObjectStore for LocalFileSystem {
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         let path = self.path_to_filesystem(location)?;
+
+        // Serve the read on the calling thread when the path and all of the data are
+        // already cached, which avoids a round trip through the blocking thread pool.
+        // On a miss, the blocking path reuses the file if it was opened.
+        #[cfg(target_os = "linux")]
+        let opened = match nowait::try_get_ranges(&path, ranges) {
+            nowait::Outcome::Read(bytes) => return Ok(bytes),
+            nowait::Outcome::Fallback(file) => file,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let opened: Option<File> = None;
+
         let ranges = ranges.to_vec();
         maybe_spawn_blocking(move || {
             // We do not read the metadata here, but error in `read_range` if necessary
-            let mut file = File::open(&path).map_err(|e| map_open_error(e, &path))?;
+            let mut file = match opened {
+                Some(file) => file,
+                None => File::open(&path).map_err(|e| map_open_error(e, &path))?,
+            };
 
             // Coalesce only contiguous/overlapping ranges (gap 0), so we never
             // read bytes that weren't requested while still collapsing adjacent
@@ -523,18 +538,7 @@ impl ObjectStore for LocalFileSystem {
                 .map(|r| read_range(&mut file, &path, r.clone()))
                 .collect::<Result<Vec<_>>>()?;
 
-            Ok(ranges
-                .iter()
-                .map(|range| {
-                    let idx = fetch_ranges.partition_point(|v| v.start <= range.start) - 1;
-                    let fetch_range = &fetch_ranges[idx];
-                    let fetch_bytes = &fetched[idx];
-
-                    let start = (range.start - fetch_range.start) as usize;
-                    let end = (range.end - fetch_range.start) as usize;
-                    fetch_bytes.slice(start..end.min(fetch_bytes.len()))
-                })
-                .collect())
+            Ok(split_fetched(&ranges, &fetch_ranges, &fetched))
         })
         .await
     }
@@ -1242,6 +1246,136 @@ pub(crate) fn chunked_stream(
     .boxed()
 }
 
+/// Maps each requested range onto the merged range that contains it.
+fn split_fetched(
+    ranges: &[Range<u64>],
+    fetch_ranges: &[Range<u64>],
+    fetched: &[Bytes],
+) -> Vec<Bytes> {
+    ranges
+        .iter()
+        .map(|range| {
+            let idx = fetch_ranges.partition_point(|v| v.start <= range.start) - 1;
+            let fetch_range = &fetch_ranges[idx];
+            let fetch_bytes = &fetched[idx];
+
+            let start = (range.start - fetch_range.start) as usize;
+            let end = (range.end - fetch_range.start) as usize;
+            fetch_bytes.slice(start..end.min(fetch_bytes.len()))
+        })
+        .collect()
+}
+
+/// Reads that never block, for serving cached data on the calling thread.
+///
+/// The path is opened with `openat2(RESOLVE_CACHED)`, which fails with `EAGAIN` instead of
+/// blocking when any part of the lookup is not in the dentry cache (Linux 5.12+). Data is read
+/// with `preadv2(RWF_NOWAIT)`, which fails with `EAGAIN` instead of blocking when the data is not
+/// in the page cache (Linux 4.14+).
+///
+/// Anything other than a complete read falls back to the blocking path. That includes cache
+/// misses, short reads at the end of the file, missing files, filesystems without `RWF_NOWAIT`
+/// support such as overlayfs, and errors, so the blocking path stays the only place that
+/// produces errors. If the file was opened, it is passed on so the fallback does not open it
+/// again.
+#[cfg(target_os = "linux")]
+mod nowait {
+    use super::{merge_ranges, split_fetched};
+    use bytes::Bytes;
+    use nix::libc;
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::ops::Range;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Cleared when the kernel or a seccomp filter rejects `openat2` or `RESOLVE_CACHED`,
+    /// so that we stop paying for a syscall that can never succeed.
+    pub(super) static SUPPORTED: AtomicBool = AtomicBool::new(true);
+
+    pub(super) enum Outcome {
+        /// Every range was read from the cache.
+        Read(Vec<Bytes>),
+        /// Use the blocking path, with the file if it was opened.
+        Fallback(Option<File>),
+    }
+
+    pub(super) fn try_get_ranges(path: &std::path::Path, ranges: &[Range<u64>]) -> Outcome {
+        if !SUPPORTED.load(Ordering::Relaxed) || ranges.iter().any(|r| r.start > r.end) {
+            return Outcome::Fallback(None);
+        }
+        let Some(file) = open_cached(path) else {
+            return Outcome::Fallback(None);
+        };
+        let fetch_ranges = merge_ranges(ranges, 0);
+        let fetched = fetch_ranges
+            .iter()
+            .map(|r| read_nowait(&file, r.clone()))
+            .collect::<Option<Vec<_>>>();
+        match fetched {
+            Some(fetched) => Outcome::Read(split_fetched(ranges, &fetch_ranges, &fetched)),
+            None => Outcome::Fallback(Some(file)),
+        }
+    }
+
+    fn open_cached(path: &std::path::Path) -> Option<File> {
+        let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: zero is a valid bit pattern for this plain struct of integers
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+        how.resolve = libc::RESOLVE_CACHED;
+        // SAFETY: `path` is a valid C string and `how` is a valid `open_how` of the given size
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                &how as *const libc::open_how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            // ENOSYS: no openat2 (before 5.6). EINVAL: no RESOLVE_CACHED (before 5.12).
+            // EPERM: blocked by a seccomp filter, as some container runtimes do.
+            if matches!(errno, Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)) {
+                SUPPORTED.store(false, Ordering::Relaxed);
+            }
+            return None;
+        }
+        // SAFETY: `fd` is a newly opened descriptor that nothing else owns
+        Some(unsafe { File::from_raw_fd(fd as libc::c_int) })
+    }
+
+    fn read_nowait(file: &File, range: Range<u64>) -> Option<Bytes> {
+        let len = usize::try_from(range.end - range.start).ok()?;
+        let mut buf: Vec<u8> = Vec::with_capacity(len);
+        let mut filled = 0;
+        while filled < len {
+            let iov = libc::iovec {
+                // SAFETY: `filled < len`, which is within the allocation
+                iov_base: unsafe { buf.as_mut_ptr().add(filled) }.cast(),
+                iov_len: len - filled,
+            };
+            let offset = libc::off_t::try_from(range.start + filled as u64).ok()?;
+            // SAFETY: the iovec points at `len - filled` writable bytes of `buf`
+            let n = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, offset, libc::RWF_NOWAIT) };
+            match n {
+                // A partial read means part of the range is cached, so try again from
+                // where it stopped. Zero means end of file, which the blocking path reports.
+                n if n > 0 => filled += n as usize,
+                -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+                }
+                _ => return None,
+            }
+        }
+        // SAFETY: the loop above initialised all `len` bytes
+        unsafe { buf.set_len(len) };
+        Some(buf.into())
+    }
+}
+
 pub(crate) fn read_range(
     file: &mut File,
     path: &std::path::Path,
@@ -1799,6 +1933,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::single_range_in_vec_init)]
+    async fn get_ranges_nowait() {
+        use super::nowait::Outcome;
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+
+        let root = TempDir::new().unwrap();
+        let integration = LocalFileSystem::new_with_prefix(root.path()).unwrap();
+        let location = Path::from("some_file");
+        let data: Bytes = (0..4096u32)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>()
+            .into();
+        integration
+            .put(&location, data.clone().into())
+            .await
+            .unwrap();
+        let path = integration.path_to_filesystem(&location).unwrap();
+
+        // The file was just written, so its path and data are cached and the read
+        // must be served without falling back, unless the kernel or filesystem
+        // lacks support (overlayfs rejects RWF_NOWAIT with EOPNOTSUPP).
+        let ranges = vec![100..120, 0..50, 40..60, 0..50, 110..130, 4000..4096];
+        match super::nowait::try_get_ranges(&path, &ranges) {
+            Outcome::Read(got) => {
+                assert_eq!(got.len(), ranges.len());
+                for (range, bytes) in ranges.iter().zip(got) {
+                    assert_eq!(bytes, data.slice(range.start as usize..range.end as usize));
+                }
+            }
+            Outcome::Fallback(None) => assert!(
+                !super::nowait::SUPPORTED.load(Ordering::Relaxed),
+                "cached path lookup fell back on a kernel that supports RESOLVE_CACHED"
+            ),
+            Outcome::Fallback(Some(file)) => {
+                let mut buf = [0u8; 1];
+                let iov = nix::libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: 1,
+                };
+                // SAFETY: the iovec points at one writable byte
+                let n = unsafe {
+                    nix::libc::preadv2(file.as_raw_fd(), &iov, 1, 0, nix::libc::RWF_NOWAIT)
+                };
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(nix::libc::EOPNOTSUPP),
+                    "cached read fell back, preadv2 returned {n}"
+                );
+                eprintln!("skipping: RWF_NOWAIT is not supported for {path:?}");
+                return;
+            }
+        }
+
+        // Ranges past the end of the file and missing files fall back, and the blocking
+        // path reports the same errors as before.
+        let falls_back = |path: &std::path::Path, ranges: &[Range<u64>]| {
+            matches!(
+                super::nowait::try_get_ranges(path, ranges),
+                Outcome::Fallback(_)
+            )
+        };
+        assert!(falls_back(&path, &[4000..5000]));
+        assert!(falls_back(&path, &[5000..5001]));
+        assert!(falls_back(&root.path().join("missing"), &[0..1]));
+        let err = integration
+            .get_ranges(&location, &[5000..5001])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Requested range was invalid"),
+            "{err}"
+        );
+        let err = integration
+            .get_ranges(&Path::from("missing"), &[0..1])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound { .. }), "{err}");
     }
 
     #[tokio::test]
